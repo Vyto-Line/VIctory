@@ -327,6 +327,17 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        let lanes = host.wave_lanes();
+        if stages.iter().any(|(s, _)| {
+            s.translated()
+                .and_then(|t| t.host.wave_lanes())
+                .is_some_and(|need| !lanes_fit(need, lanes))
+        }) {
+            return refuse(
+                "the host GPU does not run the wave size a shader needs",
+                shaders,
+            );
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -663,5 +674,24 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+/// Whether a shader's accepted wave lane counts overlap the host's.
+fn lanes_fit(shader: (u32, u32), host: (u32, u32)) -> bool {
+    shader.0 <= host.1 && host.0 <= shader.1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lanes_fit;
+
+    #[test]
+    fn wave64_needs_a_host_that_runs_64() {
+        assert!(!lanes_fit((64, 64), (32, 32))); // NVIDIA
+        assert!(!lanes_fit((64, 64), (4, 4))); // WARP
+        assert!(lanes_fit((64, 64), (32, 64))); // AMD RDNA
+        assert!(lanes_fit((32, 32), (32, 64)));
+        assert!(lanes_fit((32, 32), (32, 32)));
     }
 }

@@ -449,6 +449,32 @@ impl Host {
         })
     }
 
+    /// The wave lane counts the host runs, `WaveLaneCountMin..=Max` (WARP
+    /// 4, NVIDIA 32, AMD RDNA 32..=64); logged once.
+    pub(crate) fn wave_lanes(&self) -> (u32, u32) {
+        static LANES: OnceLock<(u32, u32)> = OnceLock::new();
+        *LANES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let lanes = if ok {
+                (options.WaveLaneCountMin, options.WaveLaneCountMax)
+            } else {
+                (0, u32::MAX)
+            };
+            tracing::info!(min = lanes.0, max = lanes.1, "host wave lane counts");
+            lanes
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.

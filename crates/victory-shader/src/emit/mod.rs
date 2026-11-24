@@ -168,6 +168,23 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// The wave lane counts the shader accepts, from its `PSV0` runtime
+    /// info (minimum at byte 16, maximum at 20); `None` when it accepts any.
+    pub fn wave_lanes(&self) -> Option<(u32, u32)> {
+        let c = Container::parse(&self.dxil).ok()?;
+        let psv = c.part(FourCC::PSV0)?.data;
+        let at = |o: usize| {
+            let b: [u8; 4] = psv.get(o..o + 4)?.try_into().ok()?;
+            Some(u32::from_le_bytes(b))
+        };
+        // The runtime info follows its own size.
+        if at(0)? < 24 {
+            return None;
+        }
+        let (min, max) = (at(4 + 16)?, at(4 + 20)?);
+        (min != 0 || max != u32::MAX).then_some((min, max))
+    }
 }
 
 /// One dword of user data and the root parameter that fills it.
