@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -216,6 +216,33 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Compute: the first of the software barrier's group-shared counters
+    /// (see [`SOFT_BARRIER_SPINS`]), when the program has one.
+    soft_barrier: Option<u32>,
+}
+
+/// Compute programs with an `s_barrier` that only some lanes reach (lanes
+/// that branched past it or left the program) get a software barrier. On
+/// the console a wave that has ended no longer counts at a barrier; on the
+/// host a thread-group barrier waits for every thread, and on NVIDIA one
+/// that a thread never reaches hangs the GPU until the driver resets it.
+/// Three group-shared counters after the program's own: threads still
+/// running, threads arrived, and the barrier's generation. An arriving
+/// thread counts itself; the one that makes the arrivals equal the running
+/// threads (or a leaving thread that does) starts the next generation,
+/// which the others wait for. A wait gives up after this many looks, so a
+/// barrier the program's threads never all reach costs time, not the GPU.
+const SOFT_BARRIER_SPINS: u32 = 1 << 16;
+
+/// The most group-shared memory a host compute program may declare, in
+/// dwords (32 KB).
+const MAX_LDS_DWORDS: u32 = 8192;
+
+/// Whether some `s_barrier` of `p` is in a block only some lanes reach.
+fn partial_barrier(p: &Program, st: &Structured) -> bool {
+    p.blocks.iter().enumerate().any(|(b, block)| {
+        st.partial.get(b) == Some(&true) && block.insts.iter().any(|i| i.name() == "s_barrier")
+    })
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -398,6 +425,14 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        let mut soft_barrier = None;
+        if let StageIo::Cs(_) = x.native.io
+            && partial_barrier(p, x.st)
+            && s.lds_dwords + 3 <= MAX_LDS_DWORDS
+        {
+            soft_barrier = Some(s.lds_dwords);
+            s.lds_dwords += 3;
+        }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
@@ -509,6 +544,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            soft_barrier,
         }
     }
 
@@ -846,6 +882,9 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+        }
+        if self.soft_barrier.is_some() {
+            self.soft_barrier_init();
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -2117,7 +2156,7 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
+        if self.s.lds_dwords == 0 || self.soft_barrier == Some(0) {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
@@ -2269,6 +2308,10 @@ impl<'a> Lower<'a> {
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
+            Fields::Sopp { .. } if name == "s_barrier" && self.soft_barrier.is_some() => {
+                self.soft_barrier_wait();
+                Ok(())
+            }
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
@@ -6645,6 +6688,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
+                self.soft_barrier_exit();
                 Term::Ret
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
@@ -6691,9 +6735,130 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        let here = std::mem::replace(&mut self.cur, a);
+        self.soft_barrier_exit();
+        self.s.m.terminate(self.cur, Term::Ret);
+        self.cur = here;
         self.abort = Some(a);
         a
+    }
+
+    /// Software barrier counter `k` (0 threads running, 1 arrived, 2
+    /// generation), addressed in the current block.
+    fn soft_counter(&mut self, k: u32) -> V {
+        let base = self.soft_barrier.expect("a software barrier");
+        let i = self.s.m.i32(base + k);
+        let lds = self.s.lds();
+        self.s.m.element(self.cur, lds, i)
+    }
+
+    /// `dx.op.barrier` with `mode` in the current block.
+    fn barrier_op(&mut self, mode: u32) {
+        let mode = self.s.m.i32(mode);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// Entry: every thread runs and none has arrived. Each thread writes
+    /// the same values; the group barrier after them is reached by all.
+    fn soft_barrier_init(&mut self) {
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        for (k, v) in [(0, threads), (1, 0), (2, 0)] {
+            let p = self.soft_counter(k);
+            let v = self.s.m.i32(v);
+            self.s.m.store(self.cur, p, v);
+        }
+        self.barrier_op(1 | 8);
+    }
+
+    /// The memory fence of a software barrier: group-shared memory, and
+    /// UAVs when the program writes them.
+    fn soft_fence(&mut self) {
+        self.barrier_op(if self.writes_uavs { 2 | 8 } else { 8 });
+    }
+
+    /// Starts the next generation if the arrived count is still `seen`
+    /// (another thread may have arrived or released since); the current
+    /// block then continues where both paths meet.
+    fn soft_release(&mut self, seen: V) {
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let (bump, done) = (self.s.m.new_block(), self.s.m.new_block());
+        let arrived = self.soft_counter(1);
+        let old = self.s.m.cmpxchg(self.cur, arrived, seen, zero);
+        let won = self.s.m.cmp(self.cur, pred::EQ, old, seen);
+        self.s.m.terminate(self.cur, Term::CondBr(won, bump, done));
+        self.cur = bump;
+        let generation = self.soft_counter(2);
+        self.s.m.atomic(bump, Rmw::Add, generation, one);
+        self.s.m.terminate(bump, Term::Br(done));
+        self.cur = done;
+    }
+
+    /// `s_barrier` as the software barrier.
+    fn soft_barrier_wait(&mut self) {
+        self.soft_fence();
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let c = self.cur;
+        let generation = self.soft_counter(2);
+        let g = self.s.m.atomic(c, Rmw::Or, generation, zero);
+        let arrived = self.soft_counter(1);
+        let n = self.s.m.atomic(c, Rmw::Add, arrived, one);
+        let n = self.s.m.bin(c, Bin::Add, n, one);
+        let running = self.soft_counter(0);
+        let a = self.s.m.atomic(c, Rmw::Or, running, zero);
+        let last = self.s.m.cmp(c, pred::IUGE, n, a);
+        let (release, wait, after) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(c, Term::CondBr(last, release, wait));
+        self.cur = release;
+        self.soft_release(n);
+        let before = self.cur;
+        self.s.m.terminate(before, Term::Br(wait));
+        // Wait for the generation to move on, a bounded number of looks.
+        self.cur = wait;
+        let k = self.s.m.phi(wait, self.s.t.i32);
+        let generation = self.soft_counter(2);
+        let now = self.s.m.atomic(wait, Rmw::Or, generation, zero);
+        let moved = self.s.m.cmp(wait, pred::NE, now, g);
+        let k1 = self.s.m.bin(wait, Bin::Add, k, one);
+        let spins = self.s.m.i32(SOFT_BARRIER_SPINS);
+        let tired = self.s.m.cmp(wait, pred::IUGE, k1, spins);
+        let stop = self.s.m.bin(wait, Bin::Or, moved, tired);
+        self.s
+            .m
+            .set_phi(k, vec![(zero, c), (zero, before), (k1, wait)]);
+        self.s.m.terminate(wait, Term::CondBr(stop, after, wait));
+        self.cur = after;
+        self.soft_fence();
+    }
+
+    /// A thread leaving a program with a software barrier: one fewer to
+    /// wait for, and if the others have all arrived, their release.
+    fn soft_barrier_exit(&mut self) {
+        if self.soft_barrier.is_none() {
+            return;
+        }
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let c = self.cur;
+        let running = self.soft_counter(0);
+        let a = self.s.m.atomic(c, Rmw::Sub, running, one);
+        let a = self.s.m.bin(c, Bin::Sub, a, one);
+        let arrived = self.soft_counter(1);
+        let r = self.s.m.atomic(c, Rmw::Or, arrived, zero);
+        let some = self.s.m.cmp(c, pred::NE, r, zero);
+        let all = self.s.m.cmp(c, pred::IUGE, r, a);
+        let last = self.s.m.bin(c, Bin::And, some, all);
+        let (release, done) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(c, Term::CondBr(last, release, done));
+        self.cur = release;
+        self.soft_release(r);
+        let end = self.cur;
+        self.s.m.terminate(end, Term::Br(done));
+        self.cur = done;
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
@@ -6818,6 +6983,47 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// Lanes 16 and up skip the barrier (`if (id < 16) barrier`); without
+    /// the compare every lane reaches it.
+    fn barrier_program(partial: bool) -> Vec<u32> {
+        let mut words = vec![];
+        if partial {
+            words.extend([
+                0x7DA8_0090, // v_cmpx_gt_u32 exec, 16, v0
+                0xBF88_0001, // s_cbranch_execz -> s_endpgm
+            ]);
+        }
+        words.extend([0xBF8A_0000, S_ENDPGM]); // s_barrier
+        words
+    }
+
+    #[test]
+    fn a_barrier_only_some_lanes_reach_is_a_software_one() {
+        for partial in [true, false] {
+            let code: Vec<u8> = barrier_program(partial)
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let p = ir::build(&code, false, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            assert_eq!(super::partial_barrier(&p, &st), partial);
+        }
+    }
+
+    #[test]
+    fn programs_with_a_software_barrier_lower() {
+        // Leaving lanes count down at the end and at a loop's limit.
+        lowers(&barrier_program(true), 0).unwrap();
+        let looped = [
+            0x7DA8_0090, // v_cmpx_gt_u32 exec, 16, v0
+            0xBF88_0002, // s_cbranch_execz -> s_endpgm
+            0xBF8A_0000, // s_barrier
+            0xBF82_FFFE, // s_branch -> s_barrier
+            S_ENDPGM,
+        ];
+        lowers(&looped, 0).unwrap();
     }
 
     #[test]

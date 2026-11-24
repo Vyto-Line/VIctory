@@ -314,6 +314,8 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Per block: whether only some of the lanes reach it.
+    pub partial: Vec<bool>,
 }
 
 /// Builds the per-lane form of `program`.
@@ -572,10 +574,23 @@ impl<'a> Lanes<'a> {
                 },
             })
             .collect();
+        // A lane-dependent atom in a block's path condition: not every lane
+        // that starts the program reaches the block (it branched away on
+        // its own bit, or left the program).
+        let partial = cond
+            .iter()
+            .map(|&c| {
+                self.b
+                    .support(c)
+                    .iter()
+                    .any(|a| !matches!(a, Atom::Uniform(_)))
+            })
+            .collect();
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
         Ok(Structured {
+            partial,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
