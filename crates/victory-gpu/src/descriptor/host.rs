@@ -69,21 +69,26 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// The dynamic slots of a heap whose host takes every title slot but not
+/// [`DYNAMIC`] more.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
-/// [`MIN_DYNAMIC`], or with diagnostics `VICTORY_DYNAMIC_SLOTS` (at most
-/// [`DYNAMIC`]): on a capped heap, more dynamic slots at the cost of title
-/// slots, to see whether draws dropped for want of them are what a frame
-/// misses.
-fn min_dynamic() -> u32 {
+/// The dynamic slots of a heap past the host's limit (capped, NVIDIA: at
+/// most 1,000,000 descriptors at any binding tier), which takes them from
+/// the top of the title's range: [`DYNAMIC`], or with diagnostics
+/// `VICTORY_DYNAMIC_SLOTS` (at most [`DYNAMIC`]). [`MIN_DYNAMIC`] ran out in
+/// Grand Theft Auto VI's world (65,536 draws dropped in a minute, most of
+/// the world's indirect mesh draws among them), whose heap of 1,245,184
+/// slots is written up to index 341,413 there, far below the 737,856 title
+/// slots this leaves; a slot past them is logged ("title slot past the
+/// host heap").
+fn capped_dynamic() -> u32 {
     #[cfg(feature = "diagnostics")]
     {
         static SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         *SLOTS.get_or_init(|| {
             let Ok(value) = std::env::var("VICTORY_DYNAMIC_SLOTS") else {
-                return MIN_DYNAMIC;
+                return DYNAMIC;
             };
             match value.trim().parse::<u32>() {
                 Ok(n) if (1..=DYNAMIC).contains(&n) => {
@@ -92,13 +97,13 @@ fn min_dynamic() -> u32 {
                 }
                 _ => {
                     tracing::warn!(value, "VICTORY_DYNAMIC_SLOTS expects 1..={DYNAMIC}");
-                    MIN_DYNAMIC
+                    DYNAMIC
                 }
             }
         })
     }
     #[cfg(not(feature = "diagnostics"))]
-    MIN_DYNAMIC
+    DYNAMIC
 }
 
 impl HostHeap {
@@ -134,14 +139,25 @@ impl HostHeap {
         } else if let Ok(heap) = make(count + DYNAMIC) {
             (heap, count, DYNAMIC)
         } else {
-            let min = min_dynamic();
-            match make(count + min) {
-                Ok(heap) => (heap, count, min),
-                Err(e) if count + min > PORTABLE_VIEWS => {
+            match make(count + MIN_DYNAMIC) {
+                Ok(heap) => (heap, count, MIN_DYNAMIC),
+                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - min, min)
+                    // out; a title that reaches them needs remapping (pages
+                    // of title slots placed on first use would fit more).
+                    let dynamic = capped_dynamic();
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        title_slots = PORTABLE_VIEWS - dynamic,
+                        dynamic,
+                        "host view heap capped at {PORTABLE_VIEWS}"
+                    );
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - dynamic,
+                        dynamic,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
