@@ -73,6 +73,34 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// [`MIN_DYNAMIC`], or with diagnostics `VICTORY_DYNAMIC_SLOTS` (at most
+/// [`DYNAMIC`]): on a capped heap, more dynamic slots at the cost of title
+/// slots, to see whether draws dropped for want of them are what a frame
+/// misses.
+fn min_dynamic() -> u32 {
+    #[cfg(feature = "diagnostics")]
+    {
+        static SLOTS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *SLOTS.get_or_init(|| {
+            let Ok(value) = std::env::var("VICTORY_DYNAMIC_SLOTS") else {
+                return MIN_DYNAMIC;
+            };
+            match value.trim().parse::<u32>() {
+                Ok(n) if (1..=DYNAMIC).contains(&n) => {
+                    tracing::warn!(n, "dynamic descriptor slots of a capped heap set");
+                    n
+                }
+                _ => {
+                    tracing::warn!(value, "VICTORY_DYNAMIC_SLOTS expects 1..={DYNAMIC}");
+                    MIN_DYNAMIC
+                }
+            }
+        })
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    MIN_DYNAMIC
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -106,13 +134,14 @@ impl HostHeap {
         } else if let Ok(heap) = make(count + DYNAMIC) {
             (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+            let min = min_dynamic();
+            match make(count + min) {
+                Ok(heap) => (heap, count, min),
+                Err(e) if count + min > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - min, min)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
