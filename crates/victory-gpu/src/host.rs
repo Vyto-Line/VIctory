@@ -301,6 +301,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Numbers the list in its debug name ([`list_name`]), by which
+    /// device-removed reports find it.
+    id: u32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -472,6 +475,9 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            static LISTS: AtomicU32 = AtomicU32::new(0);
+            let id = LISTS.fetch_add(1, Ordering::Relaxed);
+            name(&list, || list_name(id));
             Ok(HostList {
                 allocator,
                 list,
@@ -481,6 +487,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                id,
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -664,8 +671,7 @@ impl Host {
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
+                let index = run_of(runs, p);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
@@ -680,8 +686,7 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = run_of(runs, p).map(|i| runs[i]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -1851,6 +1856,35 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
     }
 }
 
+/// A host list's debug name (set with device-removed data on).
+fn list_name(id: u32) -> String {
+    format!("victory host list {id}")
+}
+
+/// Which of `runs` a breadcrumb node is about: by the list's pointer, or
+/// by its debug name. With the debug layer on, a list using indirect
+/// executions runs as the layer's own copy of it, with another pointer and
+/// our name followed by " (debug layer indirect)".
+fn run_of(runs: &[&HostList], node: &D3D12_AUTO_BREADCRUMB_NODE) -> Option<usize> {
+    let ours = node.pCommandList.as_ref().map(|l| l.as_raw());
+    if let Some(i) = runs.iter().position(|r| Some(r.list.as_raw()) == ours) {
+        return Some(i);
+    }
+    if node.pCommandListDebugNameW.is_null() {
+        return None;
+    }
+    // SAFETY: a name the runtime keeps for the node's life.
+    let name = unsafe { node.pCommandListDebugNameW.to_string() }.ok()?;
+    runs.iter().position(|r| names_list(&name, &list_name(r.id)))
+}
+
+/// Whether a breadcrumb node's list name is `ours` or the debug layer's
+/// copy of it (`ours` and a parenthesised note).
+fn names_list(name: &str, ours: &str) -> bool {
+    name.strip_prefix(ours)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(" ("))
+}
+
 /// The commands that may have been running where a list stopped at
 /// command `done`: those between the barriers around it (work between
 /// barriers overlaps on the GPU), by kind, and what the markers just
@@ -2051,5 +2085,20 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod dred_names {
+    use super::{list_name, names_list};
+
+    #[test]
+    fn breadcrumb_nodes_find_our_lists_and_the_debug_layers_copies() {
+        let ours = list_name(17);
+        assert!(names_list("victory host list 17", &ours));
+        assert!(names_list("victory host list 17 (debug layer indirect)", &ours));
+        assert!(!names_list("victory host list 170", &ours));
+        assert!(!names_list("victory host list 170 (debug layer indirect)", &ours));
+        assert!(!names_list("", &ours));
     }
 }
