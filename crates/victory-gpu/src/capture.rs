@@ -213,9 +213,93 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_PRESENT_TARGET=<w>x<h>-f<format>[#<n>]`: what to present
+/// instead of the title's image, the n-th (from 0, in first-use order) of
+/// the frame's render targets and written textures with that size and host
+/// format (as `VICTORY_DUMP_TARGETS` names its files). Shows what one stage
+/// of the frame holds, such as a G-buffer while the lighting after it does
+/// not run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Shown {
+    width: u64,
+    height: u32,
+    format: i32,
+    nth: usize,
+}
+
+fn parse_shown(value: &str) -> Option<Shown> {
+    let value = value.trim();
+    let (spec, nth) = match value.split_once('#') {
+        Some((spec, n)) => (spec, n.trim().parse().ok()?),
+        None => (value, 0),
+    };
+    let (size, format) = spec.split_once("-f")?;
+    let (width, height) = size.split_once('x')?;
+    Some(Shown {
+        width: width.parse().ok()?,
+        height: height.parse().ok()?,
+        format: format.parse().ok()?,
+        nth,
+    })
+}
+
+fn shown() -> Option<Shown> {
+    static SHOWN: std::sync::OnceLock<Option<Shown>> = std::sync::OnceLock::new();
+    *SHOWN.get_or_init(|| {
+        let value = std::env::var("VICTORY_PRESENT_TARGET").ok()?;
+        let shown = parse_shown(&value);
+        match shown {
+            Some(s) => tracing::warn!(
+                ?s,
+                "presenting a render target instead of the title's image"
+            ),
+            None => tracing::warn!(
+                value,
+                "VICTORY_PRESENT_TARGET expects <w>x<h>-f<format>[#<n>]"
+            ),
+        }
+        shown
+    })
+}
+
+/// With `VICTORY_PRESENT_TARGET`: the frame's targets so far, as
+/// [`TARGETS`] holds them for dumps.
+static FRAME_TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// At a present, with `VICTORY_PRESENT_TARGET`: the target to show instead
+/// of the title's image, if the frame used one that matches (and the
+/// frame's targets forgotten either way).
+pub(crate) fn shown_target() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    let want = shown()?;
+    let targets = std::mem::take(&mut *FRAME_TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    targets
+        .into_iter()
+        .map(|(_, copy)| copy)
+        .filter(|copy| {
+            // SAFETY: a live resource.
+            let d = unsafe { copy.texture.GetDesc() };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && d.SampleDesc.Count == 1
+                && (d.Width, d.Height, d.Format.0) == (want.width, want.height, want.format)
+        })
+        .nth(want.nth)
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() {
+        return;
+    }
+    if shown().is_some() {
+        let mut targets = FRAME_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+        if !targets.iter().any(|&(r, _)| r == resource as usize)
+            && let Some(copy) = crate::resource::host_copy(resource)
+        {
+            targets.push((resource as usize, copy));
+        }
+    }
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -523,6 +607,18 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    /// Dump file names' `<w>x<h>-f<format>`, with an optional `#<n>`.
+    #[test]
+    fn present_target_names_parse_as_dump_files_name_them() {
+        use super::{Shown, parse_shown};
+        let shown = |width, height, format, nth| Shown { width, height, format, nth };
+        assert_eq!(parse_shown("2560x1440-f28"), Some(shown(2560, 1440, 28, 0)));
+        assert_eq!(parse_shown(" 2560x1440-f10#2 "), Some(shown(2560, 1440, 10, 2)));
+        assert_eq!(parse_shown("2560x1440"), None);
+        assert_eq!(parse_shown("2560-f28"), None);
+        assert_eq!(parse_shown("2560x1440-f28#x"), None);
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,

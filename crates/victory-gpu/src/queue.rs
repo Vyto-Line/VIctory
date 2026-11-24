@@ -275,6 +275,17 @@ extern "system" fn present(
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
+    // `VICTORY_PRESENT_TARGET`: one of the frame's targets instead of the
+    // title's image (every submission has run).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(copy) = crate::capture::shown_target()
+        && let Some(host) = crate::host::host()
+    {
+        let state = copy.state.load(Ordering::Relaxed);
+        let state = crate::host::legal_state(&copy.texture, state);
+        host.present(&copy.texture, state, frame);
+        return S_OK;
+    }
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
