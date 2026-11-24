@@ -319,6 +319,18 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * n, uint4(uint(s), uint(s >> 32) ^ uint(u), uint(u >> 32), asuint(gr.x + gr.y * 3)));
         }"#,
     ),
+    // Explicit gradients with a least level of detail (`image_sample_d_cl`):
+    // gradients that pick the finest level, and clamps that hold the sample
+    // to coarser ones (none, then growing along x).
+    (
+        "gradients with a level clamp",
+        r#"CS {
+            float2 uv = (d.xy + 0.5) / 16.0;
+            float lo = tex.SampleGrad(smp, uv, float2(k.x, 0) * 0.1, float2(0, k.z) * 0.1, int2(0, 0), 0.0).x;
+            float hi = tex.SampleGrad(smp, uv, float2(k.x, 0) * 0.1, float2(0, k.z) * 0.1, int2(0, 0), d.x / 8.0).y;
+            outb.Store2(8 * (d.y * 16 + d.x), uint2(asuint(lo), asuint(hi)));
+        }"#,
+    ),
     // Comparison sampling at level 0 with an immediate comparison sampler.
     (
         "comparison sampling",

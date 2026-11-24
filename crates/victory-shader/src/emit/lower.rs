@@ -5614,11 +5614,11 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
+            "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -5688,7 +5688,10 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            // Per direction: one per spatial coordinate, but two for a cube
+            // (face space: s and t; converted at the sample).
+            let per = if kind == 5 { 2 } else { spatial };
+            let grads = if op == 63 { 2 * per } else { 0 };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -5703,9 +5706,11 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            // The face id, which explicit gradients of a cube sample need.
+            let face = cs[2];
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -5745,6 +5750,14 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // `_cl`: the least level of detail to use, the address after the
+            // coordinates (DXIL's clamp argument, undefined for none).
+            let clamp = if name.ends_with("_cl") {
+                let x = addr_val(self, first + grads + coords)?;
+                to_float(self, x)
+            } else {
+                fu
+            };
             let offsets = if kind == 5 {
                 0
             } else {
@@ -5779,7 +5792,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
@@ -5799,15 +5812,21 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    for k in 0..per {
                         let x = addr_val(self, first + k)?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, first + per + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if kind == 5 {
+                        let gx = self.cube_gradient(g[0], g[1], face);
+                        let gy = self.cube_gradient(g[3], g[4], face);
+                        g[..3].copy_from_slice(&gx);
+                        g[3..].copy_from_slice(&gy);
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -5959,12 +5978,34 @@ impl<'a> Lower<'a> {
         let u = self.s.m.bin(c, Bin::Sub, u, three);
         let v = self.s.m.bin(c, Bin::Mul, t, two);
         let v = self.s.m.bin(c, Bin::Sub, v, three);
+        let (one, mone) = (k(self, 1.0), k(self, -1.0));
+        self.cube_axes(u, v, (one, mone), face)
+    }
+
+    /// The direction-space gradient of a cube sample (DXIL's `sampleGrad`
+    /// on a cube takes the direction's) from the console's face-space one
+    /// `(ds, dt)`: on one face the direction is affine in s and t
+    /// ([`Self::cube_direction`]: u = 2s - 3, v = 2t - 3), so the gradient
+    /// is the face's axes scaled by 2 ds and 2 dt, nothing along the major
+    /// axis.
+    fn cube_gradient(&mut self, ds: V, dt: V, face: V) -> [V; 3] {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let du = self.s.m.bin(c, Bin::Mul, ds, two);
+        let dv = self.s.m.bin(c, Bin::Mul, dt, two);
+        let zero = self.s.m.f32(0);
+        self.cube_axes(du, dv, (zero, zero), face)
+    }
+
+    /// A face's direction from its in-face coordinates `u`, `v` and the
+    /// values along its major axis for the + and the - faces.
+    fn cube_axes(&mut self, u: V, v: V, (one, mone): (V, V), face: V) -> [V; 3] {
+        let c = self.cur;
         let z = self.s.m.f32(0x8000_0000);
         let (nu, nv) = (
             self.s.m.bin(c, Bin::Sub, z, u),
             self.s.m.bin(c, Bin::Sub, z, v),
         );
-        let (one, mone) = (k(self, 1.0), k(self, -1.0));
         let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         // Per face +x, -x, +y, -y, +z, -z.
         let table = [
