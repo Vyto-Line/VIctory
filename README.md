@@ -44,6 +44,33 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
+### On an RTX 3080 (2026-11-25)
+
+A second machine: Windows 11, AMD Ryzen 7 9800X3D, NVIDIA RTX 3080 **10 GB**
+(Resizable BAR off), 64 GB RAM. Series X profile, first room.
+
+- **Light in shadow:** the least indirect light where the title's
+  ray-traced probes have none, from Belobug's AMD fork
+  ([VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD),
+  `ambient.rs`, unchanged): right after the program that resolves the
+  probes, its output is replaced by a constant (`VICTORY_AMBIENT=<level>`,
+  0.6 by default; `off` keeps the title's output). Shadowed places are lit
+  flatly instead of black; no measurable cost.
+- **Frame rate, measured with the frame log:**
+
+  | Switches | Usual frame | Copy-back |
+  |----------|-------------|-----------|
+  | `VICTORY_INDIRECT_WINDOW=1` only | 171-183 ms (5.5-5.8 fps) | 103-115 ms |
+  | plus `VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_TEXTURE_NO_WAIT=1` | 156-174 ms (about 6-6.4 fps) | 48 ms |
+
+  No driver entry and no device loss in these runs. One compute program
+  of the title does not translate (against 151 in an AMD-only tree).
+- **Series S profile** (`--console series-s`, the title's lower preset at
+  1080p): 7.7 fps (130 ms a frame), **but nothing is shown**. There the
+  title ends each frame with its FSR upscaler, whose pipelines do not
+  load: `DeserializeComputePipelineStateX` fails and the pipeline state
+  method it calls is not implemented. Next to work on.
+
 ### Newest (2026-11-25, later the same day)
 
 **Update, the same night: the first room now renders right on the test
