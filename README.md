@@ -1,3 +1,41 @@
+# VIctory — NVIDIA 8 GB (Wave32) Fork
+
+A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (itself a fork of [VIctory](https://github.com/Marvisak/VIctory)), tuned for **8 GB NVIDIA GeForce (32-lane Wave32) GPUs on Windows 11**.
+
+**This repository contains no game files, code, assets, saves, caches, or binaries.** You need your own copy of the title. Licensed **GPL-3.0-or-later**.
+
+## Measured Result (RTX 4060 Laptop 8 GB)
+
+- **Hardware:** Windows 11, NVIDIA GeForce RTX 4060 Laptop GPU (8 GB VRAM, Wave32), 48 GB RAM, Series X profile.
+- **Performance & Visuals:** ~6 FPS (`172.7 ms/frame` at 5,181 draws in the first room) with full walls, doors, floor, and natural indirect lighting after one warm-up launch.
+- **Key 8 GB VRAM Finding:** Setting `VICTORY_TEXTURE_DROP_MIPS=2` (without `VICTORY_LEVELS_ON_DEMAND=1`) prevents 8 GB VRAM exhaustion so both diffuse textures and indirect lighting probes upload cleanly on the first launch.
+
+## Quick Build & Run
+
+```powershell
+cargo build --release --bin victory
+.\scripts\play-nvidia-8gb.ps1 -Exe "path\to\title.exe"
+```
+
+*(Note: The first launch warms the shader cache for the paired Wave64 lowering; subsequent launches reuse the cached shaders.)*
+
+## Credits & Integrated PRs
+
+Built on `fxceless/victory-fork@0b0074e` with the following community PRs (integration and testing were AI-assisted):
+
+- `Marvisak/VIctory#1009` (`xmem::low_guards` for >32 GB RAM Windows 11 systems)
+- `fxceless/victory-fork#610` (`VICTORY_TEXTURE_DROP_MIPS=N` for 8 GB cards)
+- `fxceless/victory-fork#799` (NVIDIA Wave32 CBV 64 KiB clamp and host fixes)
+- `fxceless/victory-fork#854` (Paired Wave64 compute lowering on 32-lane GPUs & >32 KiB mesh shaders)
+- `fxceless/victory-fork#868` (`VICTORY_SKIP_WC_COMPARE=1` write-combining copy-back reduction)
+- `fxceless/victory-fork#812` (Park unmapped view blocks to reduce `VirtualQuery` overhead)
+- `fxceless/victory-fork#768` (`VICTORY_WIDE_TEXTURES=1` parallel submission texture checks)
+- `fxceless/victory-fork#864` (Lane-order indirect window record clamping)
+- `fxceless/victory-fork#860` (Stop false trips of the `fill_ahead` latch)
+- `fxceless/victory-fork#936` (Flush `SNAPS` before dropping `Shadow`)
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
@@ -160,9 +198,15 @@ What did it, on top of the list below:
     frame (`VICTORY_CAPTURE_WORLD`, every 8th world frame) is read back
     and written as a PNG inside the present, 235 ms each.
     `VICTORY_CAPTURE_WORLD_EVERY=64` for runs that measure speed.
-  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments:
-    6.0 -> 8.9 frames a second on average in the first room, 3.1 -> 4.2
-    in the opening cutscene.
+  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments. A
+    CORRECTION: the first figures given here (6.0 against 8.9 frames a
+    second) compared two runs that stood in different scenes during the
+    measured window (about 4,300 against 1,550 draws a frame) and are
+    withdrawn. Compared at equal draws, by a line fitted to each run's
+    frame times against its draws per frame: windows off 145 ms at 4,500
+    draws and 271 ms at 10,000; windows on with `VICTORY_COPY_PLAIN=1`
+    124 ms and 211 ms. On screen: 7-8 frames a second in the first rooms,
+    10-12 in their lighter views.
   - A driver watch (on by default; `VICTORY_DRIVER_WATCH=0` off): the
     layer subscribes to the system's event log and logs every entry of a
     display driver as it is recorded; the first one turns draw windows
@@ -177,10 +221,22 @@ What did it, on top of the list below:
     sync looks at a changed page's records under one lock, fingerprint
     first; guarded view memory is left out of a submission's write-watch
     askings ahead (after triippywhale).
-  - Behind switches, built and unit-tested, not yet shown to pay:
-    `VICTORY_COPY_PLAIN=1` (copies of title memory made in place by this
+  - `VICTORY_COPY_PLAIN=1`: copies of title memory made in place by this
     process, with a handler that falls back to the kernel's copy on a
-    missing page), `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
+    missing page. Its first form also took the layer's one-byte "is this
+    page there" reads, 1,000 to 1,300 faults a frame, and won nothing;
+    reads under 256 bytes now stay with the kernel and a source that
+    faulted is left alone for two seconds (4 to 9 faults a frame). The
+    submit thread's kernel time fell from 44 to 20 ms a frame; the
+    picture is the same.
+  - The layer's submit and copy-back threads ask for the fast cores of a
+    hybrid processor (`VICTORY_FAST_CORES=0`: not): the submit thread was
+    found on a slow core in 6 % of its looks, now in none of 21,059.
+    `VICTORY_DISK_CORES=slow` (off, not measured) asks the slow cores for
+    the DirectStorage workers, which are as many as the logical
+    processors and free to run anywhere.
+  - Behind switches, built and unit-tested, not yet shown to pay:
+    `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
     `VICTORY_BACK_OWN_VIEW=1` (picture to be checked),
     `VICTORY_ASYNC_PRESENT=1` (the present goes behind the queue's line;
     no gain while the card is the limit).
@@ -195,6 +251,12 @@ What did it, on top of the list below:
   Still open: the per-record clamp is most of the card's time, and the
   copies between the PC's memory and the card's are most of the submit
   thread's; the cause of the one device loss with windows is not known.
+  A first play session past the first rooms reached the open world and
+  lost the device there with no driver entry (reason "device removed"):
+  the card had no room for new textures from the opening cutscene on
+  (9.2 of a 10.3 GB budget on a 12 GB card; 2,073 passes made no texture
+  for lack of room; 44,613 textures let go and made again in 13 minutes).
+  Cause of that removal not known either.
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).
@@ -250,6 +312,10 @@ Rendering:
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- Shader translation over the title's whole shader pack, RTX 5090 (32-lane waves), `victory translate --validate --pipelines`: 25,682 of 25,953 programs translate, validate and get a pipeline, against 25,452 at 9376fd6 (compute 2,729 of 2,734, mesh 8,694 of 8,765, pixel all 12,067, vertex all 2,192). What is left: the 195 unused voxel geometry stages, five ray-trace programs, and 71 mesh programs as translated alone (linked for their pipelines, below).
+- Console wave64 compute programs on a GPU with 32-lane waves run in a paired form where the host refused them (they asked for 64-lane waves) or where only an approximate per-half form took them: one host wave for each console wave, each thread two of its lanes. The screen-space tracing tiles, particles, decal trails, hair shadow masks and three structure-builder programs get pipelines, and 36 programs in which each half-wave counted, ORed or elected over its own 32 lanes run as on the console, at about 2.9 times their DXIL size (not timed in a run yet). `VICTORY_WAVE_PAIRS=0` turns it off.
+- Mesh programs whose outputs pass D3D12's 32 KiB as translated alone (71: pedestrian, vehicle and prop transforms) are linked with the pixel program of each pipeline, so that the mesh program writes only what that program reads (`VICTORY_MESH_LINK=0` turns it off). Offline, 710 such pairs link, validate and get a pipeline.
+- Also translated now: a float beside an integer or the front face in one signature register (one interpolation mode per register, rows in the validator's order), immediate samplers chosen by a uniform branch, pixel programs ordered by primitive (on rasterizer-ordered views), whole-wave sections that a jump splits, 64-bit floats and their wave sums, descriptors read only for their size, a subtraction on group-shared memory (NVIDIA refuses the atomic; a compare-exchange loop). Loops of ray-testing programs stop at 1,024 iterations while the builder is off (shadow mask 11.7 → 2.4 ms a frame).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -258,6 +324,7 @@ Speed and memory:
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+- On 8 GB cards, `VICTORY_TEXTURE_DROP_MIPS=1` leaves out the largest level of the 2D textures the title fills (they keep about a quarter of their bytes), so the textures picked by index fit in the card's memory budget: on an RTX 4060 Ti 8 GB, about 210 ms a frame in the first room instead of about 430, with 6,000 textures waiting instead of 15,000. Off by default.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
@@ -407,6 +474,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_MESH_LINK=0` | a mesh pipeline whose mesh program's outputs pass 32 KiB is made of the shared translations, as before, not of the pair linked for it |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
