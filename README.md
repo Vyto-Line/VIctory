@@ -82,6 +82,29 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
+### On an RTX 3080, with soldsawn's NVIDIA pull requests (2026-11-25, evening)
+
+Merged [soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb)
+(fxceless's tree with ten community pull requests for NVIDIA cards of
+little memory: paired wave64 lowering on 32-lane GPUs (#854), less
+copy-back (#868), `VICTORY_TEXTURE_DROP_MIPS` (#610) and others; see his
+README). With his switches (`VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1
+VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_COPY_PLAIN=1
+VICTORY_SKIP_WC_COMPARE=1 VICTORY_WIDE_TEXTURES=1
+VICTORY_TEXTURE_DROP_MIPS=2`) and the light in shadow below
+(`VICTORY_AMBIENT=0.6`):
+
+- **Every shader of the title translates** (one did not before; 151 in an
+  AMD-only tree).
+- **3 to 10 frames a second** in the prologue, a median of 7.5 over 30
+  minutes; copy-back 0 ms (48 before).
+- **Open:** two runs ended in the same scene of the prologue (the
+  interview), one 8 minutes in with an access violation in the title's
+  code (a read of 0xaaaaaac4, reserved and never committed: the 0xAA
+  pattern is not one the layer fills with), one with the device lost
+  ("suspended", 0x887A0005) and no entry of the driver in the system's
+  event log before it.
+
 ### On an RTX 3080 (2026-11-25)
 
 A second machine: Windows 11, AMD Ryzen 7 9800X3D, NVIDIA RTX 3080 **10 GB**
