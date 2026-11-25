@@ -1,6 +1,6 @@
 //! A least amount of indirect light.
 //!
-//! Grand Theft Auto VI's indirect diffuse light comes from probes it fills
+//! The title's indirect diffuse light comes from probes it fills
 //! by tracing rays, which do not run here yet: its program that resolves
 //! them (`CS_ScreenProbes_TemporalResolve_*`) leaves next to nothing, and
 //! whatever the sun does not reach directly is black. Right after that
